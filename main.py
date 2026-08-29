@@ -14,7 +14,7 @@ app = FastAPI(
     version="1.7.0"
 )
 
-RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "d90fe7d0-a377-11f1-a0ae-1d5fd5492d49")
+RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "")
 
 # Fallback instance ro'yxati - agar dinamik ro'yxat olinmasa ishlatiladi
 FALLBACK_PIPED_INSTANCES = [
@@ -25,6 +25,19 @@ FALLBACK_PIPED_INSTANCES = [
     "https://pipedapi.leptons.xyz",
     "https://pipedapi.reallyaweso.me",
 ]
+
+# Render "Secret Files" orqali yuklangan bo'lsa, shu yo'lda paydo bo'ladi.
+# Bu yondashuv cookies.txt'ni git repo'ga umuman qo'ymaslikka imkon beradi.
+_COOKIE_CANDIDATES = [
+    os.getenv("COOKIES_PATH", ""),
+    "/etc/secrets/cookies.txt",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt"),
+]
+COOKIES_FILE = next((p for p in _COOKIE_CANDIDATES if p and os.path.isfile(p)), None)
+if COOKIES_FILE:
+    print(f"[INFO] cookies fayli topildi: {COOKIES_FILE}")
+else:
+    print("[WARN] cookies fayli topilmadi - yt-dlp cookie'siz ishlaydi (bot-check xatosi bo'lishi mumkin)")
 
 
 def get_active_piped_instances():
@@ -120,6 +133,8 @@ def get_youtube_audio_ytdlp(search_query: str):
         "extract_flat": False,
         "socket_timeout": 10,
     }
+    if COOKIES_FILE:
+        ydl_opts["cookiefile"] = COOKIES_FILE
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
