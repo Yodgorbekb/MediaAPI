@@ -1,248 +1,285 @@
+"""
+Spotify Audio Extractor API
+---------------------------
+Spotify track linkidan metadata (nom, muallif, cover) oladi va
+YouTube'dan mos audio manbani yt-dlp orqali topib beradi.
+
+Arxitektura:
+  1. SpotifyMetadataService  -> Spotify embed sahifasidan metadata scrape qiladi
+  2. YouTubeAudioService     -> yt-dlp orqali audio stream URL topadi
+  3. FastAPI endpoint        -> ikkalasini birlashtiradi, xatolarni tartibli qaytaradi
+"""
+
 import json
+import logging
 import os
 import re
-import asyncio
+import shutil
 from typing import Optional
-from bs4 import BeautifulSoup
-from fastapi import FastAPI, Header, HTTPException, Query
+
 import requests
 import yt_dlp
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel
 
-app = FastAPI(
-    title="Spotify Audio Extractor API",
-    description="Professional tool to get metadata and audio from Spotify links.",
-    version="1.7.0"
+# --------------------------------------------------------------------------
+# Logging sozlamalari - Render Logs'da tartibli ko'rinishi uchun
+# --------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("spotify-audio-api")
+
+# --------------------------------------------------------------------------
+# Konfiguratsiya
+# --------------------------------------------------------------------------
+RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "")
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "")
 
-# Fallback instance ro'yxati - agar dinamik ro'yxat olinmasa ishlatiladi
-FALLBACK_PIPED_INSTANCES = [
-    "https://pipedapi.kavin.rocks",
-    "https://api.piped.privacydev.net",
-    "https://pipedapi.drgns.space",
-    "https://piped-api.lunar.icu",
-    "https://pipedapi.leptons.xyz",
-    "https://pipedapi.reallyaweso.me",
-]
-
-# Render "Secret Files" orqali yuklangan bo'lsa, shu yo'lda paydo bo'ladi.
-# Bu yondashuv cookies.txt'ni git repo'ga umuman qo'ymaslikka imkon beradi.
-_COOKIE_CANDIDATES = [
-    os.getenv("COOKIES_PATH", ""),
-    "/etc/secrets/cookies.txt",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt"),
-]
-COOKIES_FILE = next((p for p in _COOKIE_CANDIDATES if p and os.path.isfile(p)), None)
-if COOKIES_FILE:
-    print(f"[INFO] cookies fayli topildi: {COOKIES_FILE}")
-else:
-    print("[WARN] cookies fayli topilmadi - yt-dlp cookie'siz ishlaydi (bot-check xatosi bo'lishi mumkin)")
-
-
-def get_active_piped_instances():
+def _resolve_cookies_file() -> Optional[str]:
     """
-    piped-instances.kavin.rocks dan jonli (yaxshi holatdagi) instance
-    ro'yxatini dinamik oladi. Muvaffaqiyatsiz bo'lsa fallback ro'yxatga tushadi.
+    Cookie faylini topadi va yt-dlp yoza oladigan (/tmp) joyga nusxalaydi.
+    Render Secret Files joyi (/etc/secrets/) READ-ONLY bo'lgani uchun
+    yt-dlp'ning o'zi cookie'ni yangilamoqchi bo'lsa xato beradi - shuning
+    uchun har doim yoziladigan nusxa bilan ishlaymiz.
     """
-    try:
-        res = requests.get("https://piped-instances.kavin.rocks/", timeout=6)
-        if res.status_code == 200:
-            data = res.json()
-            instances = [
-                item["api_url"] for item in data
-                if item.get("api_url") and item.get("cdn", True) is not False
-            ]
-            if instances:
-                # eng ko'p 8 tasini sinaymiz, hammasini emas (vaqt tejash uchun)
-                return instances[:8]
-    except Exception as e:
-        print(f"[WARN] Piped instance ro'yxatini olishda xato: {e}")
+    candidates = [
+        os.getenv("COOKIES_PATH", ""),
+        "/etc/secrets/cookies.txt",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt"),
+    ]
+    source = next((p for p in candidates if p and os.path.isfile(p)), None)
 
-    return FALLBACK_PIPED_INSTANCES
-
-
-def extract_track_id(url: str) -> Optional[str]:
-    match = re.search(r"track/([a-zA-Z0-9]+)", url)
-    return match.group(1) if match else None
-
-
-def get_spotify_metadata(spotify_url: str):
-    track_id = extract_track_id(spotify_url)
-    if not track_id:
+    if not source:
+        logger.warning("cookies fayli topilmadi - cookie'siz davom etiladi")
         return None
 
-    embed_url = f"https://open.spotify.com/embed/track/{track_id}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    }
-
     try:
-        response = requests.get(embed_url, headers=headers, timeout=10)
+        writable_path = "/tmp/cookies_runtime.txt"
+        shutil.copyfile(source, writable_path)
+        logger.info("cookies fayli tayyor: %s -> %s", source, writable_path)
+        return writable_path
+    except OSError as e:
+        logger.error("cookies faylini /tmp ga nusxalab bo'lmadi: %s", e)
+        return None
+
+
+COOKIES_FILE = _resolve_cookies_file()
+
+
+# --------------------------------------------------------------------------
+# Domain modellar
+# --------------------------------------------------------------------------
+class TrackMetadata(BaseModel):
+    title: str
+    artist: str
+    cover_url: Optional[str] = None
+
+
+class AudioSource(BaseModel):
+    download_url: str
+    duration: str
+    bitrate: int
+
+
+class ExtractionError(Exception):
+    """Aniq bosqichda nima xato bo'lganini bildirish uchun maxsus exception."""
+
+    def __init__(self, stage: str, message: str):
+        self.stage = stage
+        self.message = message
+        super().__init__(f"[{stage}] {message}")
+
+
+# --------------------------------------------------------------------------
+# 1. Spotify metadata xizmati
+# --------------------------------------------------------------------------
+class SpotifyMetadataService:
+    TRACK_ID_RE = re.compile(r"track/([a-zA-Z0-9]+)")
+
+    @classmethod
+    def extract_track_id(cls, spotify_url: str) -> Optional[str]:
+        match = cls.TRACK_ID_RE.search(spotify_url)
+        return match.group(1) if match else None
+
+    @classmethod
+    def fetch(cls, spotify_url: str) -> TrackMetadata:
+        track_id = cls.extract_track_id(spotify_url)
+        if not track_id:
+            raise ExtractionError("spotify", "URL ichidan track ID topilmadi")
+
+        embed_url = f"https://open.spotify.com/embed/track/{track_id}"
+
+        try:
+            response = requests.get(
+                embed_url, headers={"User-Agent": USER_AGENT}, timeout=10
+            )
+        except requests.RequestException as e:
+            raise ExtractionError("spotify", f"So'rov yuborishda xato: {e}")
+
         if response.status_code != 200:
-            print(f"[SPOTIFY] embed status {response.status_code}")
-            return None
+            raise ExtractionError(
+                "spotify", f"Spotify embed HTTP {response.status_code} qaytardi"
+            )
 
         soup = BeautifulSoup(response.text, "html.parser")
+
+        # Asosiy usul: __NEXT_DATA__ script tegidagi JSON
+        metadata = cls._parse_next_data(soup)
+        if metadata:
+            return metadata
+
+        # Zaxira usul: og: meta teglar
+        metadata = cls._parse_og_tags(soup)
+        if metadata:
+            return metadata
+
+        raise ExtractionError(
+            "spotify", "Sahifadan metadata ajratib bo'lmadi (struktura o'zgargan bo'lishi mumkin)"
+        )
+
+    @staticmethod
+    def _parse_next_data(soup: BeautifulSoup) -> Optional[TrackMetadata]:
         script_tag = soup.find("script", id="__NEXT_DATA__")
+        if not script_tag or not script_tag.string:
+            return None
 
-        if script_tag and script_tag.string:
+        try:
             data = json.loads(script_tag.string)
-            try:
-                entity = data['props']['pageProps']['state']['data']['entity']
-                title = entity.get("title")
-                artists = entity.get("artists", [])
-                artist_name = ", ".join([a.get("name") for a in artists]) if artists else "Unknown Artist"
-                cover_url = entity.get("visualIdentity", {}).get("image", [{}])[0].get("url")
+            entity = data["props"]["pageProps"]["state"]["data"]["entity"]
+            title = entity.get("title")
+            if not title:
+                return None
 
-                if title:
-                    return {"title": title, "artist": artist_name, "cover_url": cover_url}
-            except KeyError as e:
-                print(f"[SPOTIFY] KeyError NEXT_DATA ichida: {e}")
+            artists = entity.get("artists", [])
+            artist_name = ", ".join(a.get("name", "") for a in artists) or "Unknown Artist"
+            cover_url = entity.get("visualIdentity", {}).get("image", [{}])[0].get("url")
 
-        # Fallback: og: meta teglar orqali
+            return TrackMetadata(title=title, artist=artist_name, cover_url=cover_url)
+        except (KeyError, IndexError, json.JSONDecodeError, TypeError) as e:
+            logger.debug("NEXT_DATA parse qilinmadi: %s", e)
+            return None
+
+    @staticmethod
+    def _parse_og_tags(soup: BeautifulSoup) -> Optional[TrackMetadata]:
         title_tag = soup.find("meta", property="og:title")
+        if not title_tag or not title_tag.get("content"):
+            return None
+
         image_tag = soup.find("meta", property="og:image")
         desc_tag = soup.find("meta", property="og:description")
 
-        if title_tag:
-            return {
-                "title": title_tag["content"],
-                "artist": desc_tag["content"].split(" · ")[1] if desc_tag and " · " in desc_tag["content"] else "Unknown Artist",
-                "cover_url": image_tag["content"] if image_tag else ""
-            }
-    except Exception as e:
-        print(f"[SPOTIFY] EXCEPTION: {type(e).__name__} - {e}")
+        artist = "Unknown Artist"
+        if desc_tag and desc_tag.get("content") and " · " in desc_tag["content"]:
+            parts = desc_tag["content"].split(" · ")
+            if len(parts) > 1:
+                artist = parts[1]
+
+        return TrackMetadata(
+            title=title_tag["content"],
+            artist=artist,
+            cover_url=image_tag["content"] if image_tag else None,
+        )
+
+
+# --------------------------------------------------------------------------
+# 2. YouTube audio xizmati (yt-dlp asosida)
+# --------------------------------------------------------------------------
+class YouTubeAudioService:
+    @staticmethod
+    def _build_ydl_opts() -> dict:
+        opts = {
+            "format": "bestaudio/best",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "default_search": "ytsearch1",
+            "skip_download": True,
+            "socket_timeout": 15,
+            "cachedir": False,
+            # "Sign in to confirm you're not a bot" / "page needs to be reloaded"
+            # xatolarini kamaytirish uchun tavsiya etilgan client kombinatsiyasi.
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "web"],
+                }
+            },
+        }
+        if COOKIES_FILE:
+            opts["cookiefile"] = COOKIES_FILE
+        return opts
+
+    @classmethod
+    def find_audio(cls, search_query: str) -> AudioSource:
+        try:
+            with yt_dlp.YoutubeDL(cls._build_ydl_opts()) as ydl:
+                info = ydl.extract_info(search_query, download=False)
+        except yt_dlp.utils.DownloadError as e:
+            raise ExtractionError("youtube", f"yt-dlp DownloadError: {str(e)[:300]}")
+        except Exception as e:
+            raise ExtractionError(
+                "youtube", f"Kutilmagan xato ({type(e).__name__}): {str(e)[:300]}"
+            )
+
+        if not info:
+            raise ExtractionError("youtube", "yt-dlp bo'sh natija qaytardi")
+
+        if "entries" in info:
+            entries = [e for e in info["entries"] if e]
+            if not entries:
+                raise ExtractionError("youtube", "Qidiruv natijasi bo'sh")
+            info = entries[0]
+
+        audio_format = cls._pick_best_audio_format(info)
+        if not audio_format or not audio_format.get("url"):
+            raise ExtractionError("youtube", "Mos audio format topilmadi")
+
+        duration_sec = int(info.get("duration") or 0)
+        minutes, seconds = divmod(duration_sec, 60)
+
+        return AudioSource(
+            download_url=audio_format["url"],
+            duration=f"{minutes}:{seconds:02d}",
+            bitrate=round(audio_format.get("abr") or 128),
+        )
+
+    @staticmethod
+    def _pick_best_audio_format(info: dict) -> Optional[dict]:
+        formats = info.get("formats", [])
+
+        audio_only = [
+            f for f in formats
+            if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
+        ]
+        if audio_only:
+            return max(audio_only, key=lambda f: f.get("abr") or 0)
+
+        # Audio-only format bo'lmasa, umumiy eng yaxshi format bilan qanoatlanamiz
+        if info.get("url"):
+            return info
+
         return None
 
-    return None
+
+# --------------------------------------------------------------------------
+# FastAPI ilova
+# --------------------------------------------------------------------------
+app = FastAPI(
+    title="Spotify Audio Extractor API",
+    description="Spotify track linkidan metadata va YouTube orqali audio manba topadi.",
+    version="2.0.0",
+)
 
 
-def get_youtube_audio_ytdlp(search_query: str):
-    """
-    yt-dlp orqali YouTube'dan bevosita audio manba topadi.
-    Piped'dan farqli o'laroq, vositachi serverga bog'liq emas.
-    """
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "default_search": "ytsearch1",
-        "skip_download": True,
-        "extract_flat": False,
-        "socket_timeout": 10,
-    }
-    if COOKIES_FILE:
-        ydl_opts["cookiefile"] = COOKIES_FILE
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(search_query, download=False)
-
-            if "entries" in info:
-                if not info["entries"]:
-                    return {"_debug_errors": ["yt-dlp: qidiruv natijasi bo'sh"]}
-                info = info["entries"][0]
-
-            formats = info.get("formats", [])
-            audio_formats = [
-                f for f in formats
-                if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
-            ]
-
-            if not audio_formats:
-                # audio-only topilmasa, eng yaxshi umumiy formatni olamiz
-                if info.get("url"):
-                    audio_formats = [info]
-                else:
-                    return {"_debug_errors": ["yt-dlp: audio format topilmadi"]}
-
-            best = max(audio_formats, key=lambda x: x.get("abr") or 0)
-            duration_sec = info.get("duration", 0) or 0
-            mins, secs = divmod(int(duration_sec), 60)
-
-            return {
-                "download_url": best.get("url"),
-                "duration": f"{mins}:{secs:02d}",
-                "bitrate": round(best.get("abr")) if best.get("abr") else 128,
-                "source_instance": "yt-dlp-direct",
-            }
-
-    except yt_dlp.utils.DownloadError as e:
-        return {"_debug_errors": [f"yt-dlp DownloadError: {str(e)[:300]}"]}
-    except Exception as e:
-        return {"_debug_errors": [f"yt-dlp EXCEPTION {type(e).__name__}: {str(e)[:300]}"]}
-
-
-def get_youtube_audio_piped(search_query: str):
-    """
-    Piped instance'lar orqali YouTube'dan audio manba topadi.
-    Har bir instance'dagi xatoni to'plab, oxirida debug ma'lumot bilan qaytaradi.
-    """
-    piped_instances = get_active_piped_instances()
-    errors = []
-
-    for instance in piped_instances:
-        try:
-            search_res = requests.get(
-                f"{instance}/search",
-                params={"q": search_query, "filter": "all"},
-                timeout=8,
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
-            if search_res.status_code != 200:
-                errors.append(f"{instance}: search HTTP {search_res.status_code}")
-                continue
-
-            items = search_res.json().get("items", [])
-            if not items:
-                errors.append(f"{instance}: search natijasi bo'sh")
-                continue
-
-            video_url = items[0].get("url", "")
-            if "v=" not in video_url:
-                errors.append(f"{instance}: video_id topilmadi ({video_url})")
-                continue
-            video_id = video_url.split("v=")[-1]
-
-            streams_res = requests.get(
-                f"{instance}/streams/{video_id}",
-                timeout=8,
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
-            if streams_res.status_code != 200:
-                errors.append(f"{instance}: streams HTTP {streams_res.status_code}")
-                continue
-
-            streams = streams_res.json()
-            audio_streams = streams.get("audioStreams", [])
-
-            if not audio_streams:
-                errors.append(f"{instance}: audioStreams bo'sh")
-                continue
-
-            best_audio = sorted(audio_streams, key=lambda x: x.get("bitrate", 0), reverse=True)[0]
-            duration_sec = streams.get("duration", 0)
-            mins, secs = divmod(duration_sec, 60)
-
-            print(f"[PIPED] Muvaffaqiyatli: {instance}")
-            return {
-                "download_url": best_audio.get("url"),
-                "duration": f"{mins}:{secs:02d}",
-                "bitrate": round(best_audio.get("bitrate", 0) / 1000) if best_audio.get("bitrate") else 128,
-                "source_instance": instance,
-            }
-
-        except requests.exceptions.Timeout:
-            errors.append(f"{instance}: TIMEOUT")
-            continue
-        except Exception as e:
-            errors.append(f"{instance}: EXCEPTION {type(e).__name__} - {str(e)}")
-            continue
-
-    print("[PIPED DEBUG] Barcha instance'lar muvaffaqiyatsiz:", errors)
-    return {"_debug_errors": errors}
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "cookies_loaded": COOKIES_FILE is not None}
 
 
 @app.get("/api/v1/convert")
@@ -253,43 +290,28 @@ async def convert_spotify_track(
     if RAPIDAPI_PROXY_SECRET and x_rapidapi_proxy_secret != RAPIDAPI_PROXY_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden: Invalid Proxy Secret")
 
-    metadata = await asyncio.to_thread(get_spotify_metadata, spotify_url)
-    if not metadata:
-        raise HTTPException(status_code=400, detail="Invalid Spotify URL or Track not found")
+    try:
+        metadata = SpotifyMetadataService.fetch(spotify_url)
+    except ExtractionError as e:
+        logger.warning("Spotify metadata xatosi: %s", e.message)
+        raise HTTPException(status_code=400, detail=f"Spotify metadata xatosi: {e.message}")
 
-    search_query = f"{metadata['artist']} {metadata['title']}"
+    search_query = f"{metadata.artist} {metadata.title}"
 
-    # 1-urinish: yt-dlp (asosiy, tez-tez yangilanadi, vositachi serverga bog'liq emas)
-    audio_data = await asyncio.to_thread(get_youtube_audio_ytdlp, search_query)
-    all_errors = list(audio_data.get("_debug_errors", [])) if audio_data else []
-
-    # 2-urinish: agar yt-dlp muvaffaqiyatsiz bo'lsa, Piped'ga zaxira sifatida murojaat qilamiz
-    if not audio_data or not audio_data.get("download_url"):
-        piped_result = await asyncio.to_thread(get_youtube_audio_piped, search_query)
-        all_errors += piped_result.get("_debug_errors", []) if piped_result else []
-        if piped_result and piped_result.get("download_url"):
-            audio_data = piped_result
-
-    if not audio_data or not audio_data.get("download_url"):
-        raise HTTPException(
-            status_code=404,
-            detail=f"Audio source not found. Debug: {all_errors}"
-        )
+    try:
+        audio = YouTubeAudioService.find_audio(search_query)
+    except ExtractionError as e:
+        logger.warning("YouTube audio xatosi (%s): %s", search_query, e.message)
+        raise HTTPException(status_code=404, detail=f"Audio topilmadi: {e.message}")
 
     return {
         "status": "success",
         "data": {
-            "title": metadata["title"],
-            "artist": metadata["artist"],
-            "cover_url": metadata["cover_url"],
-            "duration": audio_data["duration"],
-            "download_url": audio_data["download_url"],
-            "bitrate": audio_data["bitrate"]
-        }
+            "title": metadata.title,
+            "artist": metadata.artist,
+            "cover_url": metadata.cover_url,
+            "duration": audio.duration,
+            "download_url": audio.download_url,
+            "bitrate": audio.bitrate,
+        },
     }
-
-
-@app.get("/health")
-async def health_check():
-    """Render/uptime monitoring uchun oddiy health-check endpoint."""
-    return {"status": "ok"}
