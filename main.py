@@ -71,6 +71,7 @@ def _resolve_cookies_file() -> Optional[str]:
 
 
 COOKIES_FILE = _resolve_cookies_file()
+logger.info("yt-dlp versiyasi: %s", yt_dlp.version.__version__)
 
 
 # --------------------------------------------------------------------------
@@ -225,17 +226,17 @@ class YouTubeAudioService:
     @classmethod
     def find_audio(cls, search_query: str) -> AudioSource:
         last_error: Optional[str] = None
+        query = f"ytsearch1:{search_query}"
 
         for player_clients in cls._CLIENT_STRATEGIES:
-            # Har bir client uchun avval audio-only, keyin har qanday format bilan urinamiz
             for format_selector in ("bestaudio/best", "best"):
                 try:
                     opts = cls._build_ydl_opts(player_clients, format_selector)
                     with yt_dlp.YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(search_query, download=False)
+                        info = ydl.extract_info(query, download=False)
                 except yt_dlp.utils.DownloadError as e:
                     last_error = f"client={player_clients} format={format_selector}: {str(e)[:200]}"
-                    logger.debug("Strategiya muvaffaqiyatsiz: %s", last_error)
+                    logger.debug("YouTube strategiyasi muvaffaqiyatsiz: %s", last_error)
                     continue
                 except Exception as e:
                     last_error = f"client={player_clients}: kutilmagan xato {type(e).__name__}: {str(e)[:200]}"
@@ -260,9 +261,7 @@ class YouTubeAudioService:
                 duration_sec = int(info.get("duration") or 0)
                 minutes, seconds = divmod(duration_sec, 60)
 
-                logger.info(
-                    "Audio topildi (client=%s, format=%s)", player_clients, format_selector
-                )
+                logger.info("YouTube'dan audio topildi (client=%s)", player_clients)
                 return AudioSource(
                     download_url=audio_format["url"],
                     duration=f"{minutes}:{seconds:02d}",
@@ -284,11 +283,73 @@ class YouTubeAudioService:
         if audio_only:
             return max(audio_only, key=lambda f: f.get("abr") or 0)
 
-        # Audio-only format bo'lmasa, umumiy eng yaxshi format bilan qanoatlanamiz
         if info.get("url"):
             return info
 
         return None
+
+
+class SoundCloudAudioService:
+    """
+    SoundCloud'da bot-check yo'q, cookie kerak emas - shuning uchun
+    birinchi navbatda shu manbadan qidiramiz.
+    """
+
+    @staticmethod
+    def _build_ydl_opts() -> dict:
+        return {
+            "format": "bestaudio/best",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "socket_timeout": 15,
+            "cachedir": False,
+        }
+
+    @classmethod
+    def find_audio(cls, search_query: str) -> Optional[AudioSource]:
+        query = f"scsearch3:{search_query}"  # eng mos 3 ta natijani sinaymiz
+
+        try:
+            with yt_dlp.YoutubeDL(cls._build_ydl_opts()) as ydl:
+                info = ydl.extract_info(query, download=False)
+        except Exception as e:
+            logger.info("SoundCloud qidiruvi muvaffaqiyatsiz: %s", str(e)[:200])
+            return None
+
+        if not info or "entries" not in info:
+            return None
+
+        for entry in info["entries"]:
+            if not entry:
+                continue
+
+            audio_format = YouTubeAudioService._pick_best_audio_format(entry)
+            if audio_format and audio_format.get("url"):
+                duration_sec = int(entry.get("duration") or 0)
+                minutes, seconds = divmod(duration_sec, 60)
+                logger.info("SoundCloud'dan audio topildi: %s", entry.get("title"))
+                return AudioSource(
+                    download_url=audio_format["url"],
+                    duration=f"{minutes}:{seconds:02d}",
+                    bitrate=round(audio_format.get("abr") or 128),
+                )
+
+        return None
+
+
+class AudioSourceService:
+    """SoundCloud (asosiy) -> YouTube (zaxira) tartibida qidiradi."""
+
+    @staticmethod
+    def find_audio(search_query: str) -> AudioSource:
+        soundcloud_result = SoundCloudAudioService.find_audio(search_query)
+        if soundcloud_result:
+            return soundcloud_result
+
+        logger.info("SoundCloud'da topilmadi, YouTube'ga o'tilmoqda: %s", search_query)
+        return YouTubeAudioService.find_audio(search_query)
 
 
 # --------------------------------------------------------------------------
@@ -303,7 +364,23 @@ app = FastAPI(
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "cookies_loaded": COOKIES_FILE is not None}
+    return {"status": "ok", "cookies_loaded": COOKIES_FILE is not None, "yt_dlp_version": yt_dlp.version.__version__}
+
+
+@app.get("/debug/ytdlp-test")
+async def debug_ytdlp_test():
+    """
+    Diagnostika: mashhur, hech qachon cheklanmagan ochiq video bilan sinaydi
+    (Me at the zoo - YouTube'dagi birinchi video, hech qanday Content ID claim yo'q).
+    Agar bu ham ishlamasa - muammo muhitda (IP/tarmoq). Ishlasa - muammo faqat
+    ma'lum qo'shiqlarning cheklanganida.
+    """
+    test_video_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+    try:
+        audio = AudioSourceService.find_audio("Me at the zoo jawed karim")
+        return {"status": "success", "message": "Muhit sog'lom", "audio": audio.model_dump()}
+    except ExtractionError as e:
+        return {"status": "failed", "stage": e.stage, "message": e.message}
 
 
 @app.get("/api/v1/convert")
@@ -323,9 +400,9 @@ async def convert_spotify_track(
     search_query = f"{metadata.artist} {metadata.title}"
 
     try:
-        audio = YouTubeAudioService.find_audio(search_query)
+        audio = AudioSourceService.find_audio(search_query)
     except ExtractionError as e:
-        logger.warning("YouTube audio xatosi (%s): %s", search_query, e.message)
+        logger.warning("Audio topilmadi (%s): %s", search_query, e.message)
         raise HTTPException(status_code=404, detail=f"Audio topilmadi: {e.message}")
 
     return {
