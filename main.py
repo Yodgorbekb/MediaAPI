@@ -6,6 +6,7 @@ from typing import Optional
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException, Query
 import requests
+import yt_dlp
 
 app = FastAPI(
     title="Spotify Audio Extractor API",
@@ -104,6 +105,61 @@ def get_spotify_metadata(spotify_url: str):
     return None
 
 
+def get_youtube_audio_ytdlp(search_query: str):
+    """
+    yt-dlp orqali YouTube'dan bevosita audio manba topadi.
+    Piped'dan farqli o'laroq, vositachi serverga bog'liq emas.
+    """
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "default_search": "ytsearch1",
+        "skip_download": True,
+        "extract_flat": False,
+        "socket_timeout": 10,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(search_query, download=False)
+
+            if "entries" in info:
+                if not info["entries"]:
+                    return {"_debug_errors": ["yt-dlp: qidiruv natijasi bo'sh"]}
+                info = info["entries"][0]
+
+            formats = info.get("formats", [])
+            audio_formats = [
+                f for f in formats
+                if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
+            ]
+
+            if not audio_formats:
+                # audio-only topilmasa, eng yaxshi umumiy formatni olamiz
+                if info.get("url"):
+                    audio_formats = [info]
+                else:
+                    return {"_debug_errors": ["yt-dlp: audio format topilmadi"]}
+
+            best = max(audio_formats, key=lambda x: x.get("abr") or 0)
+            duration_sec = info.get("duration", 0) or 0
+            mins, secs = divmod(int(duration_sec), 60)
+
+            return {
+                "download_url": best.get("url"),
+                "duration": f"{mins}:{secs:02d}",
+                "bitrate": round(best.get("abr")) if best.get("abr") else 128,
+                "source_instance": "yt-dlp-direct",
+            }
+
+    except yt_dlp.utils.DownloadError as e:
+        return {"_debug_errors": [f"yt-dlp DownloadError: {str(e)[:300]}"]}
+    except Exception as e:
+        return {"_debug_errors": [f"yt-dlp EXCEPTION {type(e).__name__}: {str(e)[:300]}"]}
+
+
 def get_youtube_audio_piped(search_query: str):
     """
     Piped instance'lar orqali YouTube'dan audio manba topadi.
@@ -187,13 +243,22 @@ async def convert_spotify_track(
         raise HTTPException(status_code=400, detail="Invalid Spotify URL or Track not found")
 
     search_query = f"{metadata['artist']} {metadata['title']}"
-    audio_data = await asyncio.to_thread(get_youtube_audio_piped, search_query)
+
+    # 1-urinish: yt-dlp (asosiy, tez-tez yangilanadi, vositachi serverga bog'liq emas)
+    audio_data = await asyncio.to_thread(get_youtube_audio_ytdlp, search_query)
+    all_errors = list(audio_data.get("_debug_errors", [])) if audio_data else []
+
+    # 2-urinish: agar yt-dlp muvaffaqiyatsiz bo'lsa, Piped'ga zaxira sifatida murojaat qilamiz
+    if not audio_data or not audio_data.get("download_url"):
+        piped_result = await asyncio.to_thread(get_youtube_audio_piped, search_query)
+        all_errors += piped_result.get("_debug_errors", []) if piped_result else []
+        if piped_result and piped_result.get("download_url"):
+            audio_data = piped_result
 
     if not audio_data or not audio_data.get("download_url"):
-        debug_info = audio_data.get("_debug_errors") if audio_data else "no data returned"
         raise HTTPException(
             status_code=404,
-            detail=f"Audio source not found. Debug: {debug_info}"
+            detail=f"Audio source not found. Debug: {all_errors}"
         )
 
     return {
