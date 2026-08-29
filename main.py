@@ -6,15 +6,13 @@ from typing import Optional
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException, Query
 import requests
-import yt_dlp
 
 app = FastAPI(
     title="Spotify Audio Extractor API",
     description="Professional tool to get metadata and audio from Spotify links.",
-    version="1.5.0"
+    version="1.6.0"
 )
 
-# RapidAPI Proxy Secret
 RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "d90fe7d0-a377-11f1-a0ae-1d5fd5492d49")
 
 def extract_track_id(url: str) -> Optional[str]:
@@ -67,36 +65,58 @@ def get_spotify_metadata(spotify_url: str):
         return None
     return None
 
-def get_youtube_audio(search_query: str):
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "default_search": "ytsearch1",
-        "nocheckcertificate": True,
-        # Cookies faylini ulash (YouTube blokirovkasini aylanib o'tish uchun)
-        "cookiefile": "cookies.txt",
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "ios"]
-            }
-        }
-    }
+def get_youtube_audio_piped(search_query: str):
+    # Public Piped API lari ro'yxati (zaxira bilan)
+    piped_instances = [
+        "https://pipedapi.kavin.rocks",
+        "https://api.piped.privacydev.net",
+        "https://pipedapi.drgns.space"
+    ]
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    for instance in piped_instances:
         try:
-            info = ydl.extract_info(f"ytsearch1:{search_query}", download=False)
-            if "entries" in info and len(info["entries"]) > 0:
-                video = info["entries"][0]
+            # 1. YouTube bo'yicha qidirish
+            search_res = requests.get(
+                f"{instance}/search?q={search_query}&filter=all",
+                timeout=5
+            )
+            if search_res.status_code != 200:
+                continue
+
+            items = search_res.json().get("items", [])
+            if not items:
+                continue
+
+            video_id = items[0]["url"].split("v=")[-1]
+
+            # 2. Audio oqimini olish
+            streams_res = requests.get(
+                f"{instance}/streams/{video_id}",
+                timeout=5
+            )
+            if streams_res.status_code != 200:
+                continue
+
+            streams = streams_res.json()
+            audio_streams = streams.get("audioStreams", [])
+            
+            if audio_streams:
+                # Bitrate bo'yicha eng yaxshi audioni tanlash
+                best_audio = sorted(audio_streams, key=lambda x: x.get("bitrate", 0), reverse=True)[0]
+                
+                duration_sec = streams.get("duration", 0)
+                mins, secs = divmod(duration_sec, 60)
+                duration_str = f"{mins}:{secs:02d}"
+
                 return {
-                    "download_url": video.get("url"),
-                    "duration": video.get("duration_string"),
-                    "bitrate": video.get("abr")
+                    "download_url": best_audio.get("url"),
+                    "duration": duration_str,
+                    "bitrate": round(best_audio.get("bitrate", 0) / 1000) if best_audio.get("bitrate") else 128
                 }
         except Exception as e:
-            print("yt-dlp Error:", e)
-            return None
+            print(f"Error with instance {instance}:", e)
+            continue
+
     return None
 
 @app.get("/api/v1/convert")
@@ -104,23 +124,19 @@ async def convert_spotify_track(
     spotify_url: str = Query(..., description="Spotify track URL"),
     x_rapidapi_proxy_secret: Optional[str] = Header(None, alias="X-RapidAPI-Proxy-Secret"),
 ):
-    # 1. Xavfsizlik tekshiruvi (RapidAPI secret match)
     if RAPIDAPI_PROXY_SECRET and x_rapidapi_proxy_secret != RAPIDAPI_PROXY_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden: Invalid Proxy Secret")
 
-    # 2. Spotify ma'lumotlarini olish
     metadata = await asyncio.to_thread(get_spotify_metadata, spotify_url)
     if not metadata:
         raise HTTPException(status_code=400, detail="Invalid Spotify URL or Track not found")
 
-    # 3. Audio manzilini qidirish
-    search_query = f"{metadata['artist']} - {metadata['title']}"
-    audio_data = await asyncio.to_thread(get_youtube_audio, search_query)
+    search_query = f"{metadata['artist']} {metadata['title']}"
+    audio_data = await asyncio.to_thread(get_youtube_audio_piped, search_query)
 
     if not audio_data:
         raise HTTPException(status_code=404, detail="Audio source not found")
 
-    # 4. Natijani qaytarish
     return {
         "status": "success",
         "data": {
