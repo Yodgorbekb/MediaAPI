@@ -192,10 +192,19 @@ class SpotifyMetadataService:
 # 2. YouTube audio xizmati (yt-dlp asosida)
 # --------------------------------------------------------------------------
 class YouTubeAudioService:
+    # Turli video/client kombinatsiyalarida format topilmasligi mumkin,
+    # shuning uchun bir nechta strategiyani ketma-ket sinaymiz.
+    _CLIENT_STRATEGIES = [
+        ["android", "web"],
+        ["ios"],
+        ["tv_embedded", "web"],
+        ["web"],
+    ]
+
     @staticmethod
-    def _build_ydl_opts() -> dict:
+    def _build_ydl_opts(player_clients: list, format_selector: str) -> dict:
         opts = {
-            "format": "bestaudio/best",
+            "format": format_selector,
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
@@ -203,11 +212,9 @@ class YouTubeAudioService:
             "skip_download": True,
             "socket_timeout": 15,
             "cachedir": False,
-            # "Sign in to confirm you're not a bot" / "page needs to be reloaded"
-            # xatolarini kamaytirish uchun tavsiya etilgan client kombinatsiyasi.
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android", "web"],
+                    "player_client": player_clients,
                 }
             },
         }
@@ -217,36 +224,53 @@ class YouTubeAudioService:
 
     @classmethod
     def find_audio(cls, search_query: str) -> AudioSource:
-        try:
-            with yt_dlp.YoutubeDL(cls._build_ydl_opts()) as ydl:
-                info = ydl.extract_info(search_query, download=False)
-        except yt_dlp.utils.DownloadError as e:
-            raise ExtractionError("youtube", f"yt-dlp DownloadError: {str(e)[:300]}")
-        except Exception as e:
-            raise ExtractionError(
-                "youtube", f"Kutilmagan xato ({type(e).__name__}): {str(e)[:300]}"
-            )
+        last_error: Optional[str] = None
 
-        if not info:
-            raise ExtractionError("youtube", "yt-dlp bo'sh natija qaytardi")
+        for player_clients in cls._CLIENT_STRATEGIES:
+            # Har bir client uchun avval audio-only, keyin har qanday format bilan urinamiz
+            for format_selector in ("bestaudio/best", "best"):
+                try:
+                    opts = cls._build_ydl_opts(player_clients, format_selector)
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(search_query, download=False)
+                except yt_dlp.utils.DownloadError as e:
+                    last_error = f"client={player_clients} format={format_selector}: {str(e)[:200]}"
+                    logger.debug("Strategiya muvaffaqiyatsiz: %s", last_error)
+                    continue
+                except Exception as e:
+                    last_error = f"client={player_clients}: kutilmagan xato {type(e).__name__}: {str(e)[:200]}"
+                    continue
 
-        if "entries" in info:
-            entries = [e for e in info["entries"] if e]
-            if not entries:
-                raise ExtractionError("youtube", "Qidiruv natijasi bo'sh")
-            info = entries[0]
+                if not info:
+                    last_error = f"client={player_clients}: bo'sh natija"
+                    continue
 
-        audio_format = cls._pick_best_audio_format(info)
-        if not audio_format or not audio_format.get("url"):
-            raise ExtractionError("youtube", "Mos audio format topilmadi")
+                if "entries" in info:
+                    entries = [e for e in info["entries"] if e]
+                    if not entries:
+                        last_error = f"client={player_clients}: qidiruv natijasi bo'sh"
+                        continue
+                    info = entries[0]
 
-        duration_sec = int(info.get("duration") or 0)
-        minutes, seconds = divmod(duration_sec, 60)
+                audio_format = cls._pick_best_audio_format(info)
+                if not audio_format or not audio_format.get("url"):
+                    last_error = f"client={player_clients}: mos audio format topilmadi"
+                    continue
 
-        return AudioSource(
-            download_url=audio_format["url"],
-            duration=f"{minutes}:{seconds:02d}",
-            bitrate=round(audio_format.get("abr") or 128),
+                duration_sec = int(info.get("duration") or 0)
+                minutes, seconds = divmod(duration_sec, 60)
+
+                logger.info(
+                    "Audio topildi (client=%s, format=%s)", player_clients, format_selector
+                )
+                return AudioSource(
+                    download_url=audio_format["url"],
+                    duration=f"{minutes}:{seconds:02d}",
+                    bitrate=round(audio_format.get("abr") or 128),
+                )
+
+        raise ExtractionError(
+            "youtube", f"Barcha strategiyalar muvaffaqiyatsiz. Oxirgi xato: {last_error}"
         )
 
     @staticmethod
