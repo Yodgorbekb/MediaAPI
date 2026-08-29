@@ -14,8 +14,7 @@ app = FastAPI(
     version="1.5.0"
 )
 
-# RapidAPI Proxy Secret - Buni Render/VPS da Environment Variable qilib o'rnating
-# Agar o'rnatilmagan bo'lsa, "YOUR_FALLBACK_SECRET" ishlaydi
+# RapidAPI Proxy Secret
 RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "d90fe7d0-a377-11f1-a0ae-1d5fd5492d49")
 
 def extract_track_id(url: str) -> Optional[str]:
@@ -42,7 +41,6 @@ def get_spotify_metadata(spotify_url: str):
         
         if script_tag and script_tag.string:
             data = json.loads(script_tag.string)
-            # JSON ichidan chuqur qidirish
             try:
                 entity = data['props']['pageProps']['state']['data']['entity']
                 title = entity.get("title")
@@ -55,7 +53,6 @@ def get_spotify_metadata(spotify_url: str):
             except KeyError:
                 pass
 
-        # Fallback: Agar NEXT_DATA bo'lmasa meta teglaridan olamiz
         title_tag = soup.find("meta", property="og:title")
         image_tag = soup.find("meta", property="og:image")
         desc_tag = soup.find("meta", property="og:description")
@@ -78,12 +75,18 @@ def get_youtube_audio(search_query: str):
         "no_warnings": True,
         "default_search": "ytsearch1",
         "nocheckcertificate": True,
+        # Cookies faylini ulash (YouTube blokirovkasini aylanib o'tish uchun)
+        "cookiefile": "cookies.txt",
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios"]
+            }
+        }
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
-            # Qidiruv so'rovini aniqroq qilish
-            info = ydl.extract_info(f"ytsearch1:{search_query} official audio", download=False)
+            info = ydl.extract_info(f"ytsearch1:{search_query}", download=False)
             if "entries" in info and len(info["entries"]) > 0:
                 video = info["entries"][0]
                 return {
@@ -91,7 +94,8 @@ def get_youtube_audio(search_query: str):
                     "duration": video.get("duration_string"),
                     "bitrate": video.get("abr")
                 }
-        except Exception:
+        except Exception as e:
+            print("yt-dlp Error:", e)
             return None
     return None
 
@@ -100,11 +104,11 @@ async def convert_spotify_track(
     spotify_url: str = Query(..., description="Spotify track URL"),
     x_rapidapi_proxy_secret: Optional[str] = Header(None, alias="X-RapidAPI-Proxy-Secret"),
 ):
-    # 1. Xavfsizlik tekshiruvi (RapidAPI orqali kelayotganiga ishonch hosil qilish)
-    if x_rapidapi_proxy_secret != RAPIDAPI_PROXY_SECRET:
+    # 1. Xavfsizlik tekshiruvi (RapidAPI secret match)
+    if RAPIDAPI_PROXY_SECRET and x_rapidapi_proxy_secret != RAPIDAPI_PROXY_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden: Invalid Proxy Secret")
 
-    # 2. Spotify ma'lumotlarini olish (Blocking callni threadga o'tkazamiz)
+    # 2. Spotify ma'lumotlarini olish
     metadata = await asyncio.to_thread(get_spotify_metadata, spotify_url)
     if not metadata:
         raise HTTPException(status_code=400, detail="Invalid Spotify URL or Track not found")
